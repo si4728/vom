@@ -1,56 +1,76 @@
-# file: mqtt_audio_pub_opus.py
 import time
 import json
 import base64
 import queue
 import argparse
+from typing import Tuple
 
 import numpy as np
 import sounddevice as sd
 import paho.mqtt.client as mqtt
-from opuslib import Encoder, APPLICATION_AUDIO
 
 
-def float_to_int16_interleaved(audio_f32: np.ndarray) -> np.ndarray:
-    # audio_f32 shape: (frames, channels), range [-1,1]
+def pcm16_bytes_from_float32(audio_f32: np.ndarray) -> bytes:
+    """sounddevice float32[-1,1] -> PCM16 LE bytes"""
     audio_f32 = np.clip(audio_f32, -1.0, 1.0)
     audio_i16 = (audio_f32 * 32767.0).astype(np.int16)
-    # already interleaved if 2D (sounddevice provides interleaved memory)
-    return audio_i16
+    return audio_i16.tobytes()
+
+
+class RateAverager:
+    def __init__(self, win_sec: float = 5.0):
+        self.win_sec = win_sec
+        self.ts = []
+
+    def tick(self, t: float):
+        self.ts.append(t)
+        cutoff = t - self.win_sec
+        while self.ts and self.ts[0] < cutoff:
+            self.ts.pop(0)
+
+    def rate(self) -> float:
+        if len(self.ts) < 2:
+            return 0.0
+        dur = self.ts[-1] - self.ts[0]
+        return (len(self.ts) - 1) / dur if dur > 0 else 0.0
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="PCM16 live publisher over MQTT")
     ap.add_argument("--host", default="218.146.225.166")
     ap.add_argument("--port", type=int, default=1883)
-    ap.add_argument("--topic", default="stream/live1")  # base topic
-    ap.add_argument("--rate", type=int, default=48000, help="sample rate for Opus (8k~48k, 48k 추천)")
+    ap.add_argument("--topic", default="stream/pcm1", help="base topic (meta,audio,status 하위 토픽 사용)")
+    ap.add_argument("--rate", type=int, default=16000, help="sample rate (Hz)")
     ap.add_argument("--channels", type=int, default=1, choices=[1, 2])
-    ap.add_argument("--frame-ms", type=int, default=20, choices=[10, 20, 40, 60])
-    ap.add_argument("--bitrate", type=int, default=64000, help="bits per second (예: 64000, 96000, 128000)")
+    ap.add_argument("--block", type=int, default=512, help="frames per packet (예: 256/512/1024)")
     ap.add_argument("--qos", type=int, default=0, choices=[0, 1, 2])
-    ap.add_argument("--client-id", default=f"opus-pub-{int(time.time())}")
+    ap.add_argument("--client-id", default=f"pcm-pub-{int(time.time())}")
     ap.add_argument("--latency", default="low", help="sounddevice latency hint ('low' 권장)")
+    ap.add_argument("--queue-ms", type=int, default=200, help="오디오 큐 목표 지연(ms)")
     ap.add_argument("--username")
     ap.add_argument("--password")
     ap.add_argument("--tls", action="store_true")
     args = ap.parse_args()
 
-    frame_size = int(args.rate * args.frame_ms / 1000)  # samples per channel
     topic_audio = f"{args.topic}/audio"
     topic_meta = f"{args.topic}/meta"
     topic_status = f"{args.topic}/status"
 
-    # --- MQTT setup ---
+    # Queue capacity from time budget
+    packets_per_sec = args.rate / args.block
+    max_packets = max(3, int(np.ceil((args.queue_ms / 1000.0) * packets_per_sec)))
+    q: "queue.Queue[Tuple[bytes, float]]" = queue.Queue(maxsize=max_packets)
+
+    # MQTT client setup
     client = mqtt.Client(client_id=args.client_id, clean_session=True)
     if args.username:
         client.username_pw_set(args.username, args.password or None)
     if args.tls:
         client.tls_set()
 
-    # LWT
+    # LWT for presence
     lwt = {"type": "lwt", "status": "offline", "ts": time.time(), "client_id": args.client_id}
-    client.will_set(topic_status, json.dumps(lwt).encode("utf-8"), qos=1, retain=True)
+    client.will_set(topic_status, json.dumps(lwt), qos=1, retain=True)
 
     reconnecting = {"flag": False, "delay": 1.0}
 
@@ -58,17 +78,16 @@ def main():
         print(f"[MQTT] connected rc={rc}")
         reconnecting["flag"] = False
         reconnecting["delay"] = 1.0
-        online = {"type": "status", "status": "online", "ts": time.time(), "client_id": args.client_id}
-        c.publish(topic_status, json.dumps(online), qos=1, retain=True)
 
-        # 세션 메타(구독자 초기화용)
+        # online + meta (retain)
+        c.publish(topic_status, json.dumps({"type": "status", "status": "online", "ts": time.time()}), qos=1, retain=True)
         meta = {
             "ver": 1,
-            "codec": "opus",
+            "codec": "pcm_s16le",
             "rate": args.rate,
             "channels": args.channels,
-            "frame_ms": args.frame_ms,
-            "bitrate": args.bitrate,
+            "block": args.block,
+            "sample_width": 2,
             "start_ts": time.time(),
         }
         c.publish(topic_meta, json.dumps(meta), qos=1, retain=True)
@@ -84,47 +103,41 @@ def main():
     client.connect(args.host, args.port, keepalive=25)
     client.loop_start()
 
-    # --- Opus encoder ---
-    enc = Encoder(args.rate, args.channels, APPLICATION_AUDIO)
-    enc.bitrate = args.bitrate  # bps
-    # enc.vbr = True  # 필요 시 가변비트레이트
-
-    # --- Audio capture queue ---
-    max_queue_packets = max(3, int(np.ceil(0.2 * (1000 / args.frame_ms))))  # ~200ms 버퍼
-    q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=max_queue_packets)
-
     def audio_callback(indata, frames, time_info, status):
-        # indata: float32, shape (frames, channels)
         if status:
-            # XRuns log만 필요 시 활성화
-            # print("[AUDIO] status:", status)
+            # XRuns 등 상태 표시 필요시 로그
+            # print("[AUDIO]", status)
             pass
+        pcm = pcm16_bytes_from_float32(indata.copy())  # bytes (int16 interleaved)
+        produced_ts = time.time()
         try:
-            q.put_nowait(indata.copy())
+            q.put_nowait((pcm, produced_ts))
         except queue.Full:
             # 오래된 프레임 drop -> 지연 누적 방지
             try:
                 _ = q.get_nowait()
-                q.put_nowait(indata.copy())
+                q.put_nowait((pcm, produced_ts))
             except queue.Empty:
                 pass
 
     seq = 0
+    rate_avg = RateAverager(5.0)
     last_stat = time.time()
-    sent = 0
 
+    print(f"[PUB] host={args.host}:{args.port} topic={args.topic}")
+    print(f"[PUB] rate={args.rate}Hz ch={args.channels} block={args.block} qos={args.qos} queue={max_packets} (≈{args.queue_ms}ms)")
     try:
         with sd.InputStream(
             channels=args.channels,
             samplerate=args.rate,
-            blocksize=frame_size,  # 프레임과 동일하게 맞춤
+            blocksize=args.block,
             dtype="float32",
             latency=args.latency,
             callback=audio_callback,
         ):
-            print(f"[PUB] Opus live: {args.rate}Hz, ch={args.channels}, {args.frame_ms}ms, {args.bitrate/1000:.0f}kbps")
+            print("[PUB] 마이크 캡처 시작 (Ctrl+C 종료)")
             while True:
-                # 재접속 백오프
+                # reconnect backoff
                 if reconnecting["flag"]:
                     delay = reconnecting["delay"]
                     print(f"[MQTT] reconnecting in {delay:.1f}s ...")
@@ -137,25 +150,29 @@ def main():
                         reconnecting["delay"] = min(30.0, delay * 2.0)
                         continue
 
-                buf = q.get()  # float32 (frames, ch)
-                i16 = float_to_int16_interleaved(buf)  # int16 ndarray
-                packet = enc.encode(i16.tobytes(), frame_size)  # returns bytes (Opus frame)
+                pcm, produced_ts = q.get()
+                now = time.time()
+                q_delay_ms = (now - produced_ts) * 1000.0
 
                 payload = {
                     "ver": 1,
-                    "ts": time.time(),
+                    "ts": now,
                     "seq": seq,
-                    "data_b64": base64.b64encode(packet).decode("ascii"),
+                    "codec": "pcm_s16le",
+                    "rate": args.rate,
+                    "channels": args.channels,
+                    "block": args.block,
+                    "sample_width": 2,
+                    "data_b64": base64.b64encode(pcm).decode("ascii"),
+                    "q_delay_ms": round(q_delay_ms, 1),
                 }
-                client.publish(topic_audio, json.dumps(payload), qos=args.qos)
+                data = json.dumps(payload)
+                client.publish(topic_audio, data, qos=args.qos)
                 seq += 1
-                sent += 1
 
-                now = time.time()
+                rate_avg.tick(now)
                 if now - last_stat > 2.0:
-                    pps = sent / (now - last_stat)
-                    print(f"[STAT] tx={pps:.1f} pkt/s  (target ~{1000/args.frame_ms:.1f})")
-                    sent = 0
+                    print(f"[STAT] tx_rate={rate_avg.rate():.2f} pkt/s  q_delay≈{q_delay_ms:.0f} ms  payload≈{len(data)} B")
                     last_stat = now
 
     except KeyboardInterrupt:
